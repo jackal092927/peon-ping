@@ -10,6 +10,8 @@
 #   PEON_SYNC           1 = synchronous (for tests), 0 = async (default)
 #   PEON_BUNDLE_ID      macOS terminal bundle ID for click-to-focus (empty = skip)
 #   PEON_IDE_PID        macOS IDE ancestor PID for click-to-focus (empty = skip)
+#   PEON_NOTIF_POSITION notification position: top-center|top-right|top-left|bottom-right|bottom-left|bottom-center
+#   PEON_NOTIF_DISMISS  dismiss time in seconds (0 = persistent until clicked)
 #   TERM_PROGRAM        Terminal emulator name (for iTerm2/Kitty escape sequences)
 set -uo pipefail
 
@@ -53,9 +55,6 @@ except Exception:
 " 2>/dev/null || echo "overlay")
 fi
 
-# --- Default icon ---
-[ -z "$icon_path" ] && icon_path="$PEON_DIR/docs/peon-icon.png"
-
 # --- Sync/async mode ---
 use_bg=true
 [ "${PEON_SYNC:-0}" = "1" ] && use_bg=false
@@ -95,6 +94,76 @@ _find_overlay() {
   return 1
 }
 
+# --- Resolve pack icon from active pack's openpeon.json ---
+_resolve_pack_icon() {
+  [ -z "${PEON_DIR:-}" ] && return 1
+  local active_pack
+  active_pack=$(python3 -c "
+import json, sys
+try:
+    with open('${_PEON_DIR_PY}/config.json') as f:
+        d = json.load(f)
+    print(d.get('default_pack', d.get('active_pack', '')))
+except Exception:
+    print('')
+" 2>/dev/null) || return 1
+  [ -z "$active_pack" ] && return 1
+  local pack_dir="$PEON_DIR/packs/$active_pack"
+  [ -d "$pack_dir" ] || return 1
+  local pack_dir_py="$pack_dir"
+  [ "$PEON_PLATFORM" = "msys2" ] && pack_dir_py="$(cygpath -m "$pack_dir" 2>/dev/null || echo "$pack_dir")"
+  local icon_candidate
+  icon_candidate=$(python3 -c "
+import json, os, sys
+pack_dir = '${pack_dir_py}'
+for mname in ('openpeon.json', 'manifest.json'):
+    mpath = os.path.join(pack_dir, mname)
+    if os.path.exists(mpath):
+        try:
+            d = json.load(open(mpath))
+            print(d.get('icon', ''))
+        except Exception:
+            print('')
+        break
+else:
+    print('')
+" 2>/dev/null) || return 1
+  # Fallback: icon.png in pack directory
+  if [ -z "$icon_candidate" ] && [ -f "$pack_dir/icon.png" ]; then
+    echo "$pack_dir/icon.png"; return 0
+  fi
+  [ -z "$icon_candidate" ] && return 1
+  # URL icon: download to .icon_cache/
+  if [[ "$icon_candidate" == http://* ]] || [[ "$icon_candidate" == https://* ]]; then
+    local cache_dir="$PEON_DIR/.icon_cache"
+    mkdir -p "$cache_dir" 2>/dev/null || return 1
+    local url_hash
+    url_hash=$(python3 -c "import hashlib, sys; print(hashlib.md5(sys.argv[1].encode()).hexdigest())" "$icon_candidate" 2>/dev/null) || return 1
+    local ext="${icon_candidate%%\?*}"; ext="${ext##*.}"
+    [ "${#ext}" -gt 5 ] && ext="png"
+    local cached="$cache_dir/${url_hash}.${ext}"
+    if [ ! -f "$cached" ] && command -v curl &>/dev/null; then
+      curl -sf --max-time 5 -L -o "$cached" "$icon_candidate" 2>/dev/null || rm -f "$cached" 2>/dev/null
+    fi
+    [ -f "$cached" ] && { echo "$cached"; return 0; }
+    return 1
+  fi
+  # Local path: resolve and validate within pack directory
+  local icon_resolved pack_root
+  icon_resolved=$(python3 -c "import os, sys; print(os.path.realpath(os.path.join(sys.argv[1], sys.argv[2])))" "$pack_dir" "$icon_candidate" 2>/dev/null) || return 1
+  pack_root=$(python3 -c "import os, sys; print(os.path.realpath(sys.argv[1]) + os.sep)" "$pack_dir" 2>/dev/null) || return 1
+  if [ -n "$icon_resolved" ] && [ "${icon_resolved#"$pack_root"}" != "$icon_resolved" ] && [ -f "$icon_resolved" ]; then
+    echo "$icon_resolved"; return 0
+  fi
+  return 1
+}
+
+# --- Default icon (pack icon from openpeon.json, fallback to peon-icon.png) ---
+if [ -z "$icon_path" ]; then
+  icon_path="$(_resolve_pack_icon 2>/dev/null || echo "")"
+  [ -z "$icon_path" ] && icon_path="$PEON_DIR/docs/peon-icon.png"
+fi
+
 # ── Platform dispatch ────────────────────────────────────────────────────────
 case "$PEON_PLATFORM" in
   mac)
@@ -119,8 +188,10 @@ case "$PEON_PLATFORM" in
         fi
         local session_tty="${PEON_SESSION_TTY:-}"
         local subtitle="${PEON_MSG_SUBTITLE:-}"
-        # argv[5]=bundle_id, argv[6]=ide_pid, argv[7]=session_tty (window focus), argv[8]=subtitle
-        osascript -l JavaScript "$overlay_script" "$msg" "$color" "$local_icon_arg" "$slot" "4" "$bundle_id" "$ide_pid" "$session_tty" "$subtitle" >/dev/null 2>&1 || true
+        local dismiss_secs="${PEON_NOTIF_DISMISS:-4}"
+        local notif_position="${PEON_NOTIF_POSITION:-top-center}"
+        # argv[5]=bundle_id, argv[6]=ide_pid, argv[7]=session_tty, argv[8]=subtitle, argv[9]=position
+        osascript -l JavaScript "$overlay_script" "$msg" "$color" "$local_icon_arg" "$slot" "$dismiss_secs" "$bundle_id" "$ide_pid" "$session_tty" "$subtitle" "$notif_position" >/dev/null 2>&1 || true
         rm -rf "$slot_dir/slot-$slot"
       )
       if [ "$use_bg" = true ]; then _run_overlay & else _run_overlay; fi
@@ -241,6 +312,7 @@ TOASTEOF
           find "$slot_dir" -maxdepth 1 -name 'slot-*' -mmin +1 -exec rm -rf {} + 2>/dev/null
           slot=0; mkdir -p "$slot_dir/slot-0"
         fi
+        local dismiss_secs="${PEON_NOTIF_DISMISS:-4}"
         y_offset=$((40 + slot * 90))
         # Security: pass message via temp file to avoid PowerShell injection from untrusted $msg
         tmpmsg=$(mktemp) && printf '%s' "$msg" > "$tmpmsg"
@@ -285,8 +357,8 @@ TOASTEOF
             \$form.Controls.Add(\$label)
             \$form.Show()
           }
-          Start-Sleep -Seconds 4
-          [System.Windows.Forms.Application]::Exit()
+          if ($dismiss_secs -gt 0) { Start-Sleep -Seconds $dismiss_secs; [System.Windows.Forms.Application]::Exit() }
+          else { [System.Windows.Forms.Application]::Run() }
           if (Test-Path \$msgPath) { Remove-Item -Force \$msgPath }
         " &>/dev/null
         rm -rf "$slot_dir/slot-$slot"
@@ -372,6 +444,7 @@ TOASTEOF
           find "$slot_dir" -maxdepth 1 -name 'slot-*' -mmin +1 -exec rm -rf {} + 2>/dev/null
           slot=0; mkdir -p "$slot_dir/slot-0"
         fi
+        local dismiss_secs="${PEON_NOTIF_DISMISS:-4}"
         y_offset=$((40 + slot * 90))
         tmpmsg=$(mktemp) && printf '%s' "$msg" > "$tmpmsg"
         tmpmsg_win=$(cygpath -w "$tmpmsg")
@@ -415,8 +488,8 @@ TOASTEOF
             \$form.Controls.Add(\$label)
             \$form.Show()
           }
-          Start-Sleep -Seconds 4
-          [System.Windows.Forms.Application]::Exit()
+          if ($dismiss_secs -gt 0) { Start-Sleep -Seconds $dismiss_secs; [System.Windows.Forms.Application]::Exit() }
+          else { [System.Windows.Forms.Application]::Run() }
           if (Test-Path '$tmpmsg_win') { Remove-Item -Force '$tmpmsg_win' }
         " &>/dev/null
         rm -rf "$slot_dir/slot-$slot"

@@ -496,6 +496,22 @@ if [ "$PLATFORM" = "mac" ] && command -v swiftc &>/dev/null; then
   fi
 fi
 
+# --- Build meeting-detect (macOS mic-in-use detection) ---
+if [ "$PLATFORM" = "mac" ] && command -v swiftc &>/dev/null; then
+  MEETING_DETECT_SRC="$INSTALL_DIR/scripts/meeting-detect.swift"
+  if [ ! -f "$MEETING_DETECT_SRC" ] && [ -z "$SCRIPT_DIR" ]; then
+    curl -fsSL "$REPO_BASE/scripts/meeting-detect.swift" -o "$MEETING_DETECT_SRC" 2>/dev/null || true
+  fi
+  if [ -f "$MEETING_DETECT_SRC" ]; then
+    echo "Building meeting-detect (mic-in-use detection)..."
+    swiftc -O -o "$INSTALL_DIR/scripts/meeting-detect" \
+      "$MEETING_DETECT_SRC" \
+      -framework CoreAudio 2>/dev/null \
+      && echo "  meeting-detect built successfully" \
+      || echo "  Warning: could not build meeting-detect, using process-based fallback"
+  fi
+fi
+
 # --- Install skill (slash command) ---
 SKILL_DIR="$BASE_DIR/skills/peon-ping-toggle"
 mkdir -p "$SKILL_DIR"

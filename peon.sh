@@ -77,6 +77,36 @@ detect_headphones() {
   esac
 }
 
+# Detect if user is in an active meeting/call
+# Returns 0 (true) if meeting detected, 1 (false) if not
+detect_meeting() {
+  case "$PLATFORM" in
+    mac)
+      # Check if any microphone is in use (CoreAudio)
+      local _meeting_detect
+      _meeting_detect="$(find_bundled_script "meeting-detect")" || true
+      if [ -n "$_meeting_detect" ] && [ -x "$_meeting_detect" ]; then
+        local mic_status
+        mic_status=$("$_meeting_detect" 2>/dev/null) || true
+        [ "$mic_status" = "MIC_IN_USE" ] && return 0
+      fi
+      return 1
+      ;;
+    linux)
+      # Check mic via PipeWire/PulseAudio
+      if command -v wpctl &>/dev/null; then
+        local sources
+        sources=$(wpctl status 2>/dev/null | grep -A50 "Audio/Source" | grep "RUNNING") || true
+        [ -n "$sources" ] && return 0
+      fi
+      return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 PEON_DIR="${CLAUDE_PEON_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 # Save original install directory for finding bundled scripts (Nix, Homebrew)
 _INSTALL_DIR="$PEON_DIR"
@@ -122,6 +152,26 @@ else
   STATE_PY="$STATE"
   PEON_DIR_PY="$PEON_DIR"
 fi
+
+# --- Export paths for Python blocks (avoids shell→Python string injection) ---
+export PEON_ENV_CONFIG="$CONFIG_PY"
+export PEON_ENV_GLOBAL_CONFIG="$GLOBAL_CONFIG_PY"
+export PEON_ENV_STATE="$STATE_PY"
+export PEON_ENV_PEON_DIR="$PEON_DIR_PY"
+
+# --- Safe eval: only allow lines matching VAR=value (defense-in-depth for Python output) ---
+safe_eval_python() {
+  local output="$1"
+  [ -z "$output" ] && return 0
+  # Reject any line that doesn't look like a shell variable assignment
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    if [[ ! "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+      return 1
+    fi
+  done <<< "$output"
+  eval "$output"
+}
 
 # --- Resolve a bundled script from scripts/ (handles local + Homebrew/Cellar installs) ---
 # Prints the resolved path on success, prints nothing on failure.
@@ -209,7 +259,7 @@ play_linux_sound() {
       ;;
     paplay)
       local pa_vol
-      pa_vol=$(python3 -c "print(max(0, min(65536, int($vol * 65536))))")
+      pa_vol=$(PEON_ENV_VOL="$vol" python3 -c "import os; v=float(os.environ.get('PEON_ENV_VOL','0.5')); print(max(0, min(65536, int(v * 65536))))")
       if [ "$use_bg" = true ]; then
         nohup paplay --volume="$pa_vol" "$file" >/dev/null 2>&1 &
       else
@@ -218,7 +268,7 @@ play_linux_sound() {
       ;;
     ffplay)
       local ff_vol
-      ff_vol=$(python3 -c "print(max(0, min(100, int($vol * 100))))")
+      ff_vol=$(PEON_ENV_VOL="$vol" python3 -c "import os; v=float(os.environ.get('PEON_ENV_VOL','0.5')); print(max(0, min(100, int(v * 100))))")
       if [ "$use_bg" = true ]; then
         nohup ffplay -nodisp -autoexit -volume "$ff_vol" "$file" >/dev/null 2>&1 &
       else
@@ -297,8 +347,9 @@ play_sound() {
       else
         return 0
       fi
+      local safe_tmpdir="${tmpdir//\'/\'\'}"
       setsid powershell.exe -NoProfile -NonInteractive -Command "
-        (New-Object Media.SoundPlayer '${tmpdir}peon-ping-sound.wav').PlaySync()
+        (New-Object Media.SoundPlayer '${safe_tmpdir}peon-ping-sound.wav').PlaySync()
       " &>/dev/null &
       save_sound_pid $!
       ;;
@@ -374,7 +425,17 @@ _mac_terminal_bundle_id() {
         _bid=$(osascript -e "tell application \"System Events\" to get bundle identifier of first process whose name is \"$_candidate\"" 2>/dev/null) && [ -n "$_bid" ] && { echo "$_bid"; return; }
       done
       echo "" ;;
-    *)              echo "" ;;
+    *)
+      # Fallback: detect terminal via env vars that survive tmux/screen
+      if [ -n "${GHOSTTY_RESOURCES_DIR:-}" ]; then
+        echo "com.mitchellh.ghostty"
+      elif [ -n "${ITERM_SESSION_ID:-}" ]; then
+        echo "com.googlecode.iterm2"
+      elif [ -n "${WARP_IS_LOCAL_SHELL_SESSION:-}" ]; then
+        echo "dev.warp.Warp-Stable"
+      else
+        echo ""
+      fi ;;
   esac
 }
 
@@ -438,7 +499,7 @@ _resolve_session_tty() {
 # Args: msg, title, color (red/blue/yellow)
 send_notification() {
   local msg="$1" title="$2" color="${3:-red}"
-  local icon_path="${4:-$PEON_DIR/docs/peon-icon.png}"
+  local icon_path="${4:-}"
 
   # Synchronous mode for tests (avoid race with backgrounded processes)
   local use_bg=true
@@ -454,6 +515,8 @@ send_notification() {
       # Set env vars for notify.sh
       export PEON_PLATFORM="$PLATFORM"
       export PEON_NOTIF_STYLE="${NOTIF_STYLE:-overlay}"
+      export PEON_NOTIF_POSITION="${NOTIF_POSITION:-top-center}"
+      export PEON_NOTIF_DISMISS="${NOTIF_DISMISS:-4}"
       export PEON_DIR
       export PEON_SYNC="0"
       [ "${PEON_TEST:-0}" = "1" ] && export PEON_SYNC="1"
@@ -527,7 +590,7 @@ terminal_is_focused() {
           done
           return 1  # Different tab/pane is active in all windows — notify
           ;;
-        Terminal|Warp|Alacritty|kitty|WezTerm|Ghostty) return 0 ;;
+        Terminal|Warp|Alacritty|kitty|WezTerm|Ghostty|ghostty) return 0 ;;
         *) return 1 ;;
       esac
       ;;
@@ -565,11 +628,12 @@ send_mobile_notification() {
 
   # Read mobile config via Python (fast, single invocation)
   local mobile_vars
+  export PEON_ENV_CONFIG_RO="$config"
   mobile_vars=$(python3 -c "
-import json, sys, shlex
+import json, sys, shlex, os
 q = shlex.quote
 try:
-    cfg = json.load(open('$config'))
+    cfg = json.load(open(os.environ.get('PEON_ENV_CONFIG_RO', '')))
     mn = cfg.get('mobile_notify', {})
 except Exception:
     mn = {}
@@ -587,7 +651,7 @@ print('MOBILE_CHAT_ID=' + q(mn.get('chat_id', '')))
 print('MOBILE_BOT_TOKEN=' + q(mn.get('bot_token', '')))
 " 2>/dev/null) || return 0
 
-  eval "$mobile_vars"
+  safe_eval_python "$mobile_vars" || return 0
 
   [ -z "$MOBILE_SERVICE" ] && return 0
 
@@ -684,11 +748,12 @@ sync_adapter_configs() {
   [ ${#_ADAPTER_CONFIG_DIRS[@]} -eq 0 ] && return 0
   for _dir in "${_ADAPTER_CONFIG_DIRS[@]}"; do
     _target="$_dir/config.json"
+    export PEON_ENV_SYNC_SRC="$CONFIG_PY" PEON_ENV_SYNC_DST="$_target"
     python3 -c "
 import json, sys, os
 
-src_path = '$CONFIG'
-dst_path = '$_target'
+src_path = os.environ.get('PEON_ENV_SYNC_SRC', '')
+dst_path = os.environ.get('PEON_ENV_SYNC_DST', '')
 
 # Keys shared between peon.sh and standalone adapters
 SHARED_KEYS = ('default_pack', 'active_pack', 'volume', 'enabled', 'desktop_notifications', 'pack_rotation', 'mobile_notify')
@@ -739,12 +804,14 @@ case "${1:-}" in
     # Run headphone detection in bash before Python
     _headphones_detected=true
     detect_headphones || _headphones_detected=false
+    _verbose_flag="${2:-}"
     python3 -c "
-import json, os
+import json, os, sys
 
-config_path = '$CONFIG_PY'
-peon_dir = '$PEON_DIR_PY'
+config_path = os.environ.get('PEON_ENV_CONFIG', '')
+peon_dir = os.environ.get('PEON_ENV_PEON_DIR', '')
 headphones_detected = '$_headphones_detected' == 'true'
+verbose = '$_verbose_flag' == '--verbose'
 
 # --- Config ---
 try:
@@ -753,15 +820,38 @@ except Exception:
     c = {}
 
 dn = c.get('desktop_notifications', True)
-print('peon-ping: desktop notifications ' + ('on' if dn else 'off'))
+if verbose:
+    dn_status = 'on' if dn else 'off (sounds still play)'
+    print('peon-ping: desktop notifications ' + dn_status)
+else:
+    print('peon-ping: desktop notifications ' + ('on' if dn else 'off'))
 ns = c.get('notification_style', 'overlay')
 print('peon-ping: notification style ' + ns)
+np = c.get('notification_position', 'top-center')
+print('peon-ping: notification position ' + np)
+nd = c.get('notification_dismiss_seconds', 4)
+print('peon-ping: dismiss time ' + (str(nd) + 's' if nd > 0 else 'persistent (click to dismiss)'))
+_lbl = c.get('notification_title_override', '')
+_pmap = c.get('project_name_map', {})
+if _lbl:
+    print('peon-ping: label override: ' + _lbl)
+if _pmap:
+    print('peon-ping: project name map: ' + str(len(_pmap)) + ' pattern(s)')
+_tpls = c.get('notification_templates', {})
+if _tpls:
+    print('peon-ping: notification templates:')
+    for _tk, _tv in _tpls.items():
+        print(f'  {_tk} = "{_tv}"')
 
 mn = c.get('mobile_notify', {})
 if mn and mn.get('service'):
     enabled = mn.get('enabled', True)
     svc = mn.get('service', '?')
-    print(f'peon-ping: mobile notifications ' + ('on' if enabled else 'off') + f' ({svc})')
+    if verbose:
+        mobile_status = 'on' if enabled else 'off'
+        print(f'peon-ping: mobile notifications {mobile_status} ({svc})')
+    else:
+        print(f'peon-ping: mobile notifications ' + ('on' if enabled else 'off') + f' ({svc})')
 else:
     print('peon-ping: mobile notifications not configured')
 
@@ -856,8 +946,8 @@ else:
     case "${2:-}" in
       on)
         python3 -c "
-import json
-config_path = '$CONFIG_PY'
+import json, os
+config_path = os.environ.get('PEON_ENV_CONFIG', '')
 try:
     cfg = json.load(open(config_path))
 except Exception:
@@ -869,8 +959,8 @@ print('peon-ping: desktop notifications on')
         sync_adapter_configs; exit 0 ;;
       off)
         python3 -c "
-import json
-config_path = '$CONFIG_PY'
+import json, os
+config_path = os.environ.get('PEON_ENV_CONFIG', '')
 try:
     cfg = json.load(open(config_path))
 except Exception:
@@ -882,8 +972,8 @@ print('peon-ping: desktop notifications off')
         sync_adapter_configs; exit 0 ;;
       overlay)
         python3 -c "
-import json
-config_path = '$CONFIG_PY'
+import json, os
+config_path = os.environ.get('PEON_ENV_CONFIG', '')
 try:
     cfg = json.load(open(config_path))
 except Exception:
@@ -895,8 +985,8 @@ print('peon-ping: notification style set to overlay')
         sync_adapter_configs; exit 0 ;;
       standard)
         python3 -c "
-import json
-config_path = '$CONFIG_PY'
+import json, os
+config_path = os.environ.get('PEON_ENV_CONFIG', '')
 try:
     cfg = json.load(open(config_path))
 except Exception:
@@ -906,21 +996,149 @@ json.dump(cfg, open(config_path, 'w'), indent=2)
 print('peon-ping: notification style set to standard')
 "
         sync_adapter_configs; exit 0 ;;
+      position)
+        POS_ARG="${3:-}"
+        if [ -z "$POS_ARG" ]; then
+          python3 -c "
+import json
+try:
+    cfg = json.load(open('$CONFIG_PY'))
+    print('peon-ping: notification position ' + cfg.get('notification_position', 'top-center'))
+except Exception:
+    print('peon-ping: notification position top-center')
+"
+          exit 0
+        fi
+        python3 -c "
+import json, sys
+config_path = '$CONFIG_PY'
+pos = '$POS_ARG'
+valid = ('top-center', 'top-right', 'top-left', 'bottom-right', 'bottom-left', 'bottom-center')
+if pos not in valid:
+    print(f'peon-ping: invalid position \"{pos}\" — use one of: ' + ', '.join(valid), file=sys.stderr)
+    sys.exit(1)
+try:
+    cfg = json.load(open(config_path))
+except Exception:
+    cfg = {}
+cfg['notification_position'] = pos
+json.dump(cfg, open(config_path, 'w'), indent=2)
+print(f'peon-ping: notification position set to {pos}')
+"
+        _rc=$?; [ "$_rc" -ne 0 ] && exit "$_rc"
+        sync_adapter_configs; exit 0 ;;
+      dismiss)
+        DISMISS_ARG="${3:-}"
+        if [ -z "$DISMISS_ARG" ]; then
+          python3 -c "
+import json
+try:
+    cfg = json.load(open('$CONFIG_PY'))
+    d = cfg.get('notification_dismiss_seconds', 4)
+    if d <= 0:
+        print('peon-ping: dismiss time persistent (click to dismiss)')
+    else:
+        print(f'peon-ping: dismiss time {d}s')
+except Exception:
+    print('peon-ping: dismiss time 4s')
+"
+          exit 0
+        fi
+        python3 -c "
+import json, sys
+config_path = '$CONFIG_PY'
+try:
+    secs = int('$DISMISS_ARG')
+except ValueError:
+    print('peon-ping: invalid dismiss time \"$DISMISS_ARG\" — use a number (0 = persistent)', file=sys.stderr)
+    sys.exit(1)
+if secs < 0:
+    print('peon-ping: dismiss time cannot be negative', file=sys.stderr)
+    sys.exit(1)
+try:
+    cfg = json.load(open(config_path))
+except Exception:
+    cfg = {}
+cfg['notification_dismiss_seconds'] = secs
+json.dump(cfg, open(config_path, 'w'), indent=2)
+if secs == 0:
+    print('peon-ping: notifications set to persistent (click to dismiss)')
+else:
+    print(f'peon-ping: dismiss time set to {secs}s')
+"
+        _rc=$?; [ "$_rc" -ne 0 ] && exit "$_rc"
+        sync_adapter_configs; exit 0 ;;
+      label)
+        LABEL_ARG="${3:-}"
+        if [ -z "$LABEL_ARG" ]; then
+          python3 -c "
+import json
+try:
+    cfg = json.load(open('$CONFIG_PY'))
+    lbl = cfg.get('notification_title_override', '')
+    pmap = cfg.get('project_name_map', {})
+    if lbl:
+        print(f'peon-ping: label override: {lbl}')
+    else:
+        print('peon-ping: no label override set')
+    if pmap:
+        print(f'peon-ping: project name map ({len(pmap)} patterns):')
+        for pat, name in pmap.items():
+            print(f'  {pat} → {name}')
+except Exception:
+    print('peon-ping: no label override set')
+"
+          exit 0
+        fi
+        if [ "$LABEL_ARG" = "reset" ]; then
+          python3 -c "
+import json
+config_path = '$CONFIG_PY'
+try:
+    cfg = json.load(open(config_path))
+except Exception:
+    cfg = {}
+cfg['notification_title_override'] = ''
+json.dump(cfg, open(config_path, 'w'), indent=2)
+print('peon-ping: label override cleared')
+"
+          sync_adapter_configs; exit 0
+        fi
+        python3 -c "
+import json, sys
+config_path = '$CONFIG_PY'
+label = sys.argv[1][:50]
+try:
+    cfg = json.load(open(config_path))
+except Exception:
+    cfg = {}
+cfg['notification_title_override'] = label
+json.dump(cfg, open(config_path, 'w'), indent=2)
+print(f'peon-ping: label override set to \"{label}\"')
+" "$LABEL_ARG"
+        _rc=$?; [ "$_rc" -ne 0 ] && exit "$_rc"
+        sync_adapter_configs; exit 0 ;;
       test)
         # Read config to check if notifications are enabled and get style
-        eval "$(python3 -c "
-import json, shlex
+        local _py_out
+        _py_out="$(python3 -c "
+import json, shlex, os
 q = shlex.quote
-config_path = '$CONFIG_PY'
+config_path = os.environ.get('PEON_ENV_CONFIG', '')
 try:
     cfg = json.load(open(config_path))
 except Exception:
     cfg = {}
 dn = cfg.get('desktop_notifications', True)
 ns = cfg.get('notification_style', 'overlay')
+np = cfg.get('notification_position', 'top-center')
+nd = cfg.get('notification_dismiss_seconds', 4)
 print('_NOTIF_ENABLED=' + ('true' if dn else 'false'))
 print('NOTIF_STYLE=' + q(ns))
+print('NOTIF_POSITION=' + q(np))
+print('NOTIF_DISMISS=' + q(str(nd)))
 ")"
+        safe_eval_python "$_py_out" || true
         if [ "$_NOTIF_ENABLED" != "true" ]; then
           echo "peon-ping: desktop notifications are off (run 'peon notifications on' to enable)" >&2
           exit 1
@@ -928,29 +1146,140 @@ print('NOTIF_STYLE=' + q(ns))
         echo "peon-ping: sending test notification (style: $NOTIF_STYLE)"
         PEON_TEST=1 send_notification "This is a test notification" "peon-ping" "blue"
         exit 0 ;;
+      template)
+        TPL_KEY="${3:-}"
+        TPL_VAL="${4:-}"
+        if [ -z "$TPL_KEY" ]; then
+          # Show all templates
+          python3 -c "
+import json
+try:
+    cfg = json.load(open('$CONFIG_PY'))
+    tpls = cfg.get('notification_templates', {})
+except Exception:
+    tpls = {}
+if not tpls:
+    print('peon-ping: no notification templates configured (using defaults)')
+else:
+    valid = ('stop', 'permission', 'error', 'idle', 'question')
+    for k in valid:
+        v = tpls.get(k, '')
+        if v:
+            print(f'peon-ping: template {k} = \"{v}\"')
+    extra = set(tpls) - set(valid)
+    for k in sorted(extra):
+        print(f'peon-ping: template {k} = \"{tpls[k]}\" (unknown key)')
+"
+          exit 0
+        fi
+        if [ "$TPL_KEY" = "--reset" ]; then
+          python3 -c "
+import json
+config_path = '$CONFIG_PY'
+try:
+    cfg = json.load(open(config_path))
+except Exception:
+    cfg = {}
+cfg.pop('notification_templates', None)
+json.dump(cfg, open(config_path, 'w'), indent=2)
+print('peon-ping: notification templates cleared')
+"
+          sync_adapter_configs; exit 0
+        fi
+        # Validate key and set/show value
+        python3 -c "
+import json, sys
+config_path = '$CONFIG_PY'
+key = '$TPL_KEY'
+valid = ('stop', 'permission', 'error', 'idle', 'question')
+if key not in valid:
+    print(f'peon-ping: invalid template key \"{key}\" — use one of: ' + ', '.join(valid), file=sys.stderr)
+    sys.exit(1)
+val = sys.argv[1] if len(sys.argv) > 1 else ''
+if not val:
+    # Show single template
+    try:
+        cfg = json.load(open(config_path))
+        tpls = cfg.get('notification_templates', {})
+    except Exception:
+        tpls = {}
+    v = tpls.get(key, '')
+    if v:
+        print(f'peon-ping: template {key} = \"{v}\"')
+    else:
+        print(f'peon-ping: template {key} not set (default: \"{{project}}\")')
+    sys.exit(0)
+try:
+    cfg = json.load(open(config_path))
+except Exception:
+    cfg = {}
+tpls = cfg.get('notification_templates', {})
+tpls[key] = val
+cfg['notification_templates'] = tpls
+json.dump(cfg, open(config_path, 'w'), indent=2)
+print(f'peon-ping: template {key} set to \"{val}\"')
+" "$TPL_VAL"
+        _rc=$?; [ "$_rc" -ne 0 ] && exit "$_rc"
+        sync_adapter_configs; exit 0 ;;
       *)
-        echo "Usage: peon notifications <on|off|overlay|standard|test>" >&2; exit 1 ;;
+        echo "Usage: peon notifications <on|off|overlay|standard|position|dismiss|label|template|test>" >&2; exit 1 ;;
+    esac ;;
+  popups)
+    # Alias for 'notifications' command - same behavior
+    case "${2:-}" in
+      on)
+        python3 -c "
+import json, os
+config_path = os.environ.get('PEON_ENV_CONFIG', '')
+try:
+    cfg = json.load(open(config_path))
+except Exception:
+    cfg = {}
+cfg['desktop_notifications'] = True
+json.dump(cfg, open(config_path, 'w'), indent=2)
+print('peon-ping: desktop notifications on')
+"
+        sync_adapter_configs; exit 0 ;;
+      off)
+        python3 -c "
+import json, os
+config_path = os.environ.get('PEON_ENV_CONFIG', '')
+try:
+    cfg = json.load(open(config_path))
+except Exception:
+    cfg = {}
+cfg['desktop_notifications'] = False
+json.dump(cfg, open(config_path, 'w'), indent=2)
+print('peon-ping: desktop notifications off')
+"
+        sync_adapter_configs; exit 0 ;;
+      *)
+        echo "Usage: peon popups on|off" >&2
+        exit 1 ;;
     esac ;;
   volume)
     VOL_ARG="${2:-}"
     if [ -z "$VOL_ARG" ]; then
+      export PEON_ENV_CONFIG_RO="$CONFIG_PY"
       python3 -c "
-import json
+import json, os
 try:
-    cfg = json.load(open('$CONFIG_PY'))
+    cfg = json.load(open(os.environ.get('PEON_ENV_CONFIG_RO', '')))
     print('peon-ping: volume ' + str(cfg.get('volume', 0.5)))
 except Exception:
     print('peon-ping: volume 0.5')
 "
       exit 0
     fi
+    export PEON_ENV_VOL_ARG="$VOL_ARG"
     python3 -c "
-import json, sys
-config_path = '$CONFIG_PY'
+import json, sys, os
+config_path = os.environ.get('PEON_ENV_CONFIG', '')
+vol_arg = os.environ.get('PEON_ENV_VOL_ARG', '')
 try:
-    vol = float('$VOL_ARG')
+    vol = float(vol_arg)
 except ValueError:
-    print('peon-ping: invalid volume \"$VOL_ARG\" — use a number between 0.0 and 1.0', file=sys.stderr)
+    print('peon-ping: invalid volume \"' + vol_arg + '\" — use a number between 0.0 and 1.0', file=sys.stderr)
     sys.exit(1)
 if not (0.0 <= vol <= 1.0):
     print('peon-ping: volume must be between 0.0 and 1.0', file=sys.stderr)
@@ -967,10 +1296,11 @@ print(f'peon-ping: volume set to {vol}')
   rotation)
     ROT_ARG="${2:-}"
     if [ -z "$ROT_ARG" ]; then
+      export PEON_ENV_CONFIG_RO="$CONFIG_PY"
       python3 -c "
-import json
+import json, os
 try:
-    cfg = json.load(open('$CONFIG_PY'))
+    cfg = json.load(open(os.environ.get('PEON_ENV_CONFIG_RO', '')))
     mode = cfg.get('pack_rotation_mode', 'random')
     rotation = cfg.get('pack_rotation', [])
     print('peon-ping: rotation mode: ' + mode)
@@ -985,15 +1315,16 @@ except Exception:
     fi
     case "$ROT_ARG" in
       random|round-robin|session_override|agentskill)
+        export PEON_ENV_ROT_ARG="$ROT_ARG"
         python3 -c "
-import json
-config_path = '$CONFIG_PY'
+import json, os
+config_path = os.environ.get('PEON_ENV_CONFIG', '')
 try:
     cfg = json.load(open(config_path))
 except Exception:
     cfg = {}
 # Normalize agentskill alias to session_override
-mode = '$ROT_ARG'
+mode = os.environ.get('PEON_ENV_ROT_ARG', '')
 if mode == 'agentskill':
     mode = 'session_override'
 cfg['pack_rotation_mode'] = mode
@@ -1020,13 +1351,13 @@ print('peon-ping: rotation mode set to ' + mode)
         fi
         python3 -c "
 import json, os, glob
-config_path = '$CONFIG_PY'
+config_path = os.environ.get('PEON_ENV_CONFIG', '')
 try:
     _cfg_list = json.load(open(config_path))
     active = _cfg_list.get('default_pack', _cfg_list.get('active_pack', 'peon'))
 except Exception:
     active = 'peon'
-packs_dir = '$PEON_DIR_PY/packs'
+packs_dir = os.path.join(os.environ.get('PEON_ENV_PEON_DIR', ''), 'packs')
 for d in sorted(os.listdir(packs_dir)):
     for mname in ('openpeon.json', 'manifest.json'):
         mpath = os.path.join(packs_dir, d, mname)
@@ -1069,9 +1400,9 @@ for d in sorted(os.listdir(packs_dir)):
 
         PACK_ARG="$PACK_ARG" python3 -c "
 import json, os, glob, sys
-config_path = '$CONFIG_PY'
+config_path = os.environ.get('PEON_ENV_CONFIG', '')
 pack_arg = os.environ.get('PACK_ARG', '')
-packs_dir = '$PEON_DIR_PY/packs'
+packs_dir = os.path.join(os.environ.get('PEON_ENV_PEON_DIR', ''), 'packs')
 names = sorted([
     d for d in os.listdir(packs_dir)
     if os.path.isdir(os.path.join(packs_dir, d)) and (
@@ -1116,13 +1447,13 @@ print(f'peon-ping: switched to {pack_arg} ({display})')
       next)
         python3 -c "
 import json, os, glob
-config_path = '$CONFIG_PY'
+config_path = os.environ.get('PEON_ENV_CONFIG', '')
 try:
     cfg = json.load(open(config_path))
 except Exception:
     cfg = {}
 active = cfg.get('default_pack', cfg.get('active_pack', 'peon'))
-packs_dir = '$PEON_DIR_PY/packs'
+packs_dir = os.path.join(os.environ.get('PEON_ENV_PEON_DIR', ''), 'packs')
 names = sorted([
     d for d in os.listdir(packs_dir)
     if os.path.isdir(os.path.join(packs_dir, d)) and (
@@ -1156,8 +1487,8 @@ print(f'peon-ping: switched to {next_pack} ({display})')
           PACKS_TO_REMOVE=$(python3 -c "
 import json, os, sys
 
-config_path = '$CONFIG_PY'
-peon_dir = '$PEON_DIR_PY'
+config_path = os.environ.get('PEON_ENV_CONFIG', '')
+peon_dir = os.environ.get('PEON_ENV_PEON_DIR', '')
 packs_dir = os.path.join(peon_dir, 'packs')
 
 try:
@@ -1185,8 +1516,8 @@ print(','.join(removable))
           PACKS_TO_REMOVE=$(REMOVE_ARG="$REMOVE_ARG" python3 -c "
 import json, os, sys
 
-config_path = '$CONFIG_PY'
-peon_dir = '$PEON_DIR_PY'
+config_path = os.environ.get('PEON_ENV_CONFIG', '')
+peon_dir = os.environ.get('PEON_ENV_PEON_DIR', '')
 packs_dir = os.path.join(peon_dir, 'packs')
 remove_arg = os.environ.get('REMOVE_ARG', '')
 
@@ -1248,13 +1579,14 @@ print(','.join(valid))
         esac
 
         # Delete pack directories and clean config
+        export PEON_ENV_PACKS_TO_REMOVE="$PACKS_TO_REMOVE"
         python3 -c "
 import json, os, shutil
 
-config_path = '$CONFIG_PY'
-peon_dir = '$PEON_DIR_PY'
+config_path = os.environ.get('PEON_ENV_CONFIG', '')
+peon_dir = os.environ.get('PEON_ENV_PEON_DIR', '')
 packs_dir = os.path.join(peon_dir, 'packs')
-to_remove = '$PACKS_TO_REMOVE'.split(',')
+to_remove = os.environ.get('PEON_ENV_PACKS_TO_REMOVE', '').split(',')
 
 for pack in to_remove:
     pack_path = os.path.join(packs_dir, pack)
@@ -1312,7 +1644,7 @@ import json, os, shutil, sys
 
 src = os.environ['LOCAL_SRC']
 force = os.environ.get('LOCAL_FORCE', '0') == '1'
-packs_dir = os.path.join('$PEON_DIR_PY', 'packs')
+packs_dir = os.path.join(os.environ.get('PEON_ENV_PEON_DIR', ''), 'packs')
 
 manifest_name = 'openpeon.json' if os.path.exists(os.path.join(src, 'openpeon.json')) else 'manifest.json'
 if os.path.exists(os.path.join(src, manifest_name)):
@@ -1353,8 +1685,8 @@ print(f'Use peon packs use {pack_name} to activate it')
             ROT_ARG="$ROT_ARG" python3 -c "
 import json, os, sys
 
-config_path = '$GLOBAL_CONFIG_PY'
-peon_dir = '$PEON_DIR_PY'
+config_path = os.environ.get('PEON_ENV_GLOBAL_CONFIG', '')
+peon_dir = os.environ.get('PEON_ENV_PEON_DIR', '')
 packs_dir = os.path.join(peon_dir, 'packs')
 add_arg = os.environ.get('ROT_ARG', '')
 
@@ -1404,7 +1736,7 @@ print('Rotation: ' + ', '.join(rotation))
             ROT_ARG="$ROT_ARG" python3 -c "
 import json, os, sys
 
-config_path = '$GLOBAL_CONFIG_PY'
+config_path = os.environ.get('PEON_ENV_GLOBAL_CONFIG', '')
 remove_arg = os.environ.get('ROT_ARG', '')
 
 try:
@@ -1438,8 +1770,8 @@ print('Rotation: ' + ', '.join(rotation))
             sync_adapter_configs; exit 0 ;;
           list|"")
             python3 -c "
-import json
-config_path = '$GLOBAL_CONFIG_PY'
+import json, os
+config_path = os.environ.get('PEON_ENV_GLOBAL_CONFIG', '')
 try:
     cfg = json.load(open(config_path))
 except Exception:
@@ -1481,9 +1813,10 @@ else:
             --token=*)  NTFY_TOKEN="${arg#--token=}" ;;
           esac
         done
+        export PEON_ENV_NTFY_TOPIC="$TOPIC" PEON_ENV_NTFY_SERVER="$NTFY_SERVER" PEON_ENV_NTFY_TOKEN="$NTFY_TOKEN"
         python3 -c "
-import json
-config_path = '$CONFIG_PY'
+import json, os
+config_path = os.environ.get('PEON_ENV_CONFIG', '')
 try:
     cfg = json.load(open(config_path))
 except Exception:
@@ -1491,9 +1824,9 @@ except Exception:
 cfg['mobile_notify'] = {
     'enabled': True,
     'service': 'ntfy',
-    'topic': '$TOPIC',
-    'server': '$NTFY_SERVER',
-    'token': '$NTFY_TOKEN'
+    'topic': os.environ.get('PEON_ENV_NTFY_TOPIC', ''),
+    'server': os.environ.get('PEON_ENV_NTFY_SERVER', 'https://ntfy.sh'),
+    'token': os.environ.get('PEON_ENV_NTFY_TOKEN', '')
 }
 json.dump(cfg, open(config_path, 'w'), indent=2)
 "
@@ -1514,9 +1847,10 @@ json.dump(cfg, open(config_path, 'w'), indent=2)
           echo "Usage: peon mobile pushover <user_key> <app_token>" >&2
           exit 1
         fi
+        export PEON_ENV_PO_USER_KEY="$USER_KEY" PEON_ENV_PO_APP_TOKEN="$APP_TOKEN"
         python3 -c "
-import json
-config_path = '$CONFIG_PY'
+import json, os
+config_path = os.environ.get('PEON_ENV_CONFIG', '')
 try:
     cfg = json.load(open(config_path))
 except Exception:
@@ -1524,8 +1858,8 @@ except Exception:
 cfg['mobile_notify'] = {
     'enabled': True,
     'service': 'pushover',
-    'user_key': '$USER_KEY',
-    'app_token': '$APP_TOKEN'
+    'user_key': os.environ.get('PEON_ENV_PO_USER_KEY', ''),
+    'app_token': os.environ.get('PEON_ENV_PO_APP_TOKEN', '')
 }
 json.dump(cfg, open(config_path, 'w'), indent=2)
 "
@@ -1538,9 +1872,10 @@ json.dump(cfg, open(config_path, 'w'), indent=2)
           echo "Usage: peon mobile telegram <bot_token> <chat_id>" >&2
           exit 1
         fi
+        export PEON_ENV_TG_BOT_TOKEN="$BOT_TOKEN" PEON_ENV_TG_CHAT_ID="$CHAT_ID"
         python3 -c "
-import json
-config_path = '$CONFIG_PY'
+import json, os
+config_path = os.environ.get('PEON_ENV_CONFIG', '')
 try:
     cfg = json.load(open(config_path))
 except Exception:
@@ -1548,8 +1883,8 @@ except Exception:
 cfg['mobile_notify'] = {
     'enabled': True,
     'service': 'telegram',
-    'bot_token': '$BOT_TOKEN',
-    'chat_id': '$CHAT_ID'
+    'bot_token': os.environ.get('PEON_ENV_TG_BOT_TOKEN', ''),
+    'chat_id': os.environ.get('PEON_ENV_TG_CHAT_ID', '')
 }
 json.dump(cfg, open(config_path, 'w'), indent=2)
 "
@@ -1833,11 +2168,18 @@ Commands:
   status               Check if paused or active
   volume [0.0-1.0]     Get or set volume level
   rotation [mode]      Get or set pack rotation mode (random|round-robin|session_override)
-  notifications on        Enable desktop notifications
-  notifications off       Disable desktop notifications
+  notifications on        Enable desktop notification popups (sounds continue playing)
+  notifications off       Disable desktop notification popups (sounds continue playing)
   notifications overlay   Use large overlay banners (default)
   notifications standard  Use standard system notifications
+  notifications position [pos]  Get or set overlay position
+                       Positions: top-center (default), top-right, top-left,
+                       bottom-right, bottom-left, bottom-center
+  notifications dismiss [N]  Get or set auto-dismiss time in seconds (0 = persistent)
+  notifications label [text|reset]  Get, set, or reset notification label override
+  notifications template [key] [fmt]  Get/set message templates (keys: stop, permission, error, idle, question)
   notifications test      Send a test notification
+  popups on|off         Alias for 'notifications' - toggle desktop notification popups
   preview [category]   Play all sounds from a category (default: session.start)
   preview --list       List all categories and sound counts in the active pack
                        Categories: session.start, task.acknowledge, task.complete,
@@ -2175,6 +2517,8 @@ annoyed_window = float(cfg.get('annoyed_window_seconds', 10))
 silent_window = float(cfg.get('silent_window_seconds', 0))
 suppress_subagent_complete = str(cfg.get('suppress_subagent_complete', False)).lower() == 'true'
 headphones_only = str(cfg.get('headphones_only', False)).lower() == 'true'
+meeting_detect = str(cfg.get('meeting_detect', False)).lower() == 'true'
+suppress_sound_when_tab_focused = str(cfg.get('suppress_sound_when_tab_focused', False)).lower() == 'true'
 
 cats = cfg.get('categories', {})
 cat_enabled = {}
@@ -2371,21 +2715,44 @@ state['last_active'] = dict(session_id=session_id, pack=active_pack,
                             timestamp=time.time(), event=event, cwd=cwd)
 state_dirty = True
 
-# --- Project name (git repo name, fallback to directory name) ---
-project = ''
+# --- Project name (priority chain: .peon-label > project_name_map > title_override > git repo > folder) ---
+project = None
+
+# 1. .peon-label file in project root
 if cwd:
+    _lf = os.path.join(cwd, '.peon-label')
+    if os.path.isfile(_lf):
+        try:
+            _l = open(_lf).read().strip().split('\n')[0][:50]
+            if _l: project = _l
+        except Exception: pass
+
+# 2. project_name_map (glob pattern matching)
+if not project:
+    for _pat, _label in cfg.get('project_name_map', {}).items():
+        if cwd and fnmatch.fnmatch(cwd, _pat):
+            project = str(_label)[:50]; break
+
+# 3. Static override
+if not project:
+    _ov = cfg.get('notification_title_override', '')
+    if _ov: project = str(_ov)[:50]
+
+# 4. Git repo name
+if not project and cwd:
     try:
         import subprocess
         _git_remote = subprocess.check_output(
             ['git', 'remote', 'get-url', 'origin'],
             cwd=cwd, stderr=subprocess.DEVNULL, timeout=2
         ).decode().strip()
-        # Extract repo name from URL (handles ssh and https)
         project = _git_remote.rstrip('/').rsplit('/', 1)[-1].removesuffix('.git')
     except Exception:
         pass
-    if not project:
-        project = cwd.rsplit('/', 1)[-1]
+
+# 5. Folder name fallback
+if not project and cwd:
+    project = cwd.rsplit('/', 1)[-1]
 if not project:
     project = 'claude'
 project = re.sub(r'[^a-zA-Z0-9 ._-]', '', project)
@@ -2550,6 +2917,17 @@ if event == 'SessionStart':
     session_starts[session_id] = now
     state['session_start_times'] = session_starts
     state_dirty = True
+    # --- Debounce rapid SessionStart events (e.g. multi-workspace IDE startup) ---
+    # When IDEs open many workspaces at once, each fires SessionStart simultaneously.
+    # Only the first one plays the greeting; the rest stay quiet until the cooldown expires.
+    _ss_cooldown = float(cfg.get('session_start_cooldown_seconds', 30))
+    if _ss_cooldown > 0:
+        _last_ss = state.get('last_session_start_sound_time', 0)
+        if now - _last_ss < _ss_cooldown:
+            category = ''  # another workspace just greeted — stay quiet
+        else:
+            state['last_session_start_sound_time'] = now
+            state_dirty = True
 elif category:
     session_starts = state.get('session_start_times', {})
     start_time = session_starts.get(session_id, 0)
@@ -2603,9 +2981,25 @@ if category and not paused:
             elif os.path.isfile(os.path.join(pack_dir, 'icon.png')):
                 icon_candidate = 'icon.png'
             if icon_candidate:
-                icon_resolved = os.path.realpath(os.path.join(pack_dir, icon_candidate))
-                if icon_resolved.startswith(pack_root) and os.path.isfile(icon_resolved):
-                    icon_path = icon_resolved
+                if icon_candidate.startswith(('http://', 'https://')):
+                    import hashlib, urllib.request
+                    cache_dir = os.path.join(peon_dir, '.icon_cache')
+                    os.makedirs(cache_dir, exist_ok=True)
+                    url_hash = hashlib.md5(icon_candidate.encode()).hexdigest()
+                    ext_parts = icon_candidate.split('?')[0].rsplit('.', 1)
+                    ext = ext_parts[1][:5] if len(ext_parts) > 1 else 'png'
+                    cached = os.path.join(cache_dir, url_hash + '.' + ext)
+                    if not os.path.isfile(cached):
+                        try:
+                            urllib.request.urlretrieve(icon_candidate, cached)
+                        except Exception:
+                            cached = ''
+                    if cached and os.path.isfile(cached):
+                        icon_path = cached
+                else:
+                    icon_resolved = os.path.realpath(os.path.join(pack_dir, icon_candidate))
+                    if icon_resolved.startswith(pack_root) and os.path.isfile(icon_resolved):
+                        icon_path = icon_resolved
     except Exception:
         pass
 
@@ -2691,6 +3085,33 @@ if tab_color_enabled:
         rgb = colors[status_key]
         tab_color_rgb = f'{rgb[0]} {rgb[1]} {rgb[2]}'
 
+# --- Notification message template resolution ---
+from collections import defaultdict as _defaultdict
+_templates = cfg.get('notification_templates', {})
+_tpl_key_map = {
+    'task.complete': 'stop',
+    'task.error': 'error',
+}
+_tpl_key = _tpl_key_map.get(category, '')
+if event == 'Notification':
+    if ntype == 'idle_prompt': _tpl_key = 'idle'
+    elif ntype == 'elicitation_dialog': _tpl_key = 'question'
+elif event == 'PermissionRequest':
+    _tpl_key = 'permission'
+_tpl = _templates.get(_tpl_key, '')
+if _tpl:
+    _tpl_vars = _defaultdict(str, {
+        'project': project,
+        'summary': event_data.get('transcript_summary', '').strip()[:120],
+        'tool_name': event_data.get('tool_name', ''),
+        'status': status,
+        'event': event,
+    })
+    try:
+        msg = _tpl.format_map(_tpl_vars)
+    except Exception:
+        pass
+
 # --- Output shell variables ---
 print('PEON_EXIT=false')
 print('EVENT=' + q(event))
@@ -2704,12 +3125,16 @@ print('MSG=' + q(msg))
 print('MSG_SUBTITLE=' + q(msg_subtitle))
 print('DESKTOP_NOTIF=' + ('true' if desktop_notif else 'false'))
 print('NOTIF_STYLE=' + q(cfg.get('notification_style', 'overlay')))
+print('NOTIF_POSITION=' + q(cfg.get('notification_position', 'top-center')))
+print('NOTIF_DISMISS=' + q(str(cfg.get('notification_dismiss_seconds', 4))))
 print('USE_SOUND_EFFECTS_DEVICE=' + q(str(use_sound_effects_device).lower()))
 print('LINUX_AUDIO_PLAYER=' + q(linux_audio_player))
 mn = cfg.get('mobile_notify', {})
 mobile_on = bool(mn and mn.get('service') and mn.get('enabled', True))
 print('MOBILE_NOTIF=' + ('true' if mobile_on else 'false'))
 print('HEADPHONES_ONLY=' + ('true' if headphones_only else 'false'))
+print('MEETING_DETECT=' + ('true' if meeting_detect else 'false'))
+print('SUPPRESS_SOUND_WHEN_TAB_FOCUSED=' + ('true' if suppress_sound_when_tab_focused else 'false'))
 print('SOUND_FILE=' + q(sound_file))
 print('ICON_PATH=' + q(icon_path))
 print('TRAINER_SOUND=' + q(trainer_sound))
@@ -2723,6 +3148,16 @@ print('TAB_COLOR_RGB=' + q(tab_color_rgb))
 HEADPHONES_DETECTED=true
 if [ "${HEADPHONES_ONLY:-false}" = "true" ]; then
   detect_headphones || HEADPHONES_DETECTED=false
+fi
+
+IN_MEETING=false
+if [ "${MEETING_DETECT:-false}" = "true" ]; then
+  detect_meeting && IN_MEETING=true
+fi
+
+# Resolve session tty early so _run_sound_and_notify can check tab focus
+if [ "${SUPPRESS_SOUND_WHEN_TAB_FOCUSED:-false}" = "true" ]; then
+  _resolve_session_tty
 fi
 
 # --- Check for updates (SessionStart only, once per day, non-blocking) ---
@@ -2816,21 +3251,31 @@ if [ -n "$TAB_COLOR_RGB" ] && [[ "${TERM_PROGRAM:-}" == "iTerm.app" ]]; then
 fi
 
 _run_sound_and_notify() {
+  local _focused=""  # lazy: empty = not yet checked
+
   # --- Play sound ---
   if [ -n "$SOUND_FILE" ] && [ -f "$SOUND_FILE" ]; then
+    local _skip_sound=false
     # Check headphones_only: skip sound if enabled but no headphones detected
     if [ "${HEADPHONES_ONLY:-false}" = "true" ] && [ "${HEADPHONES_DETECTED:-true}" = "false" ]; then
-      : # Skip sound - headphones required but not detected
-    else
-      play_sound "$SOUND_FILE" "$VOLUME"
+      _skip_sound=true
     fi
+    # Check meeting_detect: skip sound if in a meeting
+    if [ "$_skip_sound" = "false" ] && [ "${MEETING_DETECT:-false}" = "true" ] && [ "${IN_MEETING:-false}" = "true" ]; then
+      _skip_sound=true
+    fi
+    # Check suppress_sound_when_tab_focused: skip sound if tab is focused
+    if [ "$_skip_sound" = "false" ] && [ "${SUPPRESS_SOUND_WHEN_TAB_FOCUSED:-false}" = "true" ]; then
+      [ -z "$_focused" ] && { terminal_is_focused && _focused=true || _focused=false; }
+      [ "$_focused" = "true" ] && _skip_sound=true
+    fi
+    [ "$_skip_sound" = "false" ] && play_sound "$SOUND_FILE" "$VOLUME"
   fi
 
   # --- Smart notification: only when terminal is NOT frontmost ---
   if [ -n "$NOTIFY" ] && [ "$PAUSED" != "true" ] && [ "${DESKTOP_NOTIF:-true}" = "true" ]; then
-    if ! terminal_is_focused; then
-      send_notification "$MSG" "$TITLE" "${NOTIFY_COLOR:-red}" "${ICON_PATH:-}"
-    fi
+    [ -z "$_focused" ] && { terminal_is_focused && _focused=true || _focused=false; }
+    [ "$_focused" != "true" ] && send_notification "$MSG" "$TITLE" "${NOTIFY_COLOR:-red}" "${ICON_PATH:-}"
   fi
 
   # --- Mobile push notification (always sends when configured, regardless of focus) ---
@@ -2867,11 +3312,16 @@ if [ -n "${TRAINER_SOUND:-}" ] && [ -f "$TRAINER_SOUND" ]; then
       fi
       # Brief pause after main sound ends for natural spacing
       sleep 0.5
-      play_sound "$TRAINER_SOUND" "$VOLUME"
+      local _trainer_focused=""
+      if [ "${SUPPRESS_SOUND_WHEN_TAB_FOCUSED:-false}" = "true" ]; then
+        terminal_is_focused && _trainer_focused=true || _trainer_focused=false
+        [ "$_trainer_focused" != "true" ] && play_sound "$TRAINER_SOUND" "$VOLUME"
+      else
+        play_sound "$TRAINER_SOUND" "$VOLUME"
+      fi
       if [ -n "$NOTIFY" ] && [ "$PAUSED" != "true" ] && [ "${DESKTOP_NOTIF:-true}" = "true" ]; then
-        if ! terminal_is_focused; then
-          send_notification "Peon Trainer" "${TRAINER_MSG:-Time for reps!}" "blue"
-        fi
+        [ -z "$_trainer_focused" ] && { terminal_is_focused && _trainer_focused=true || _trainer_focused=false; }
+        [ "$_trainer_focused" != "true" ] && send_notification "Peon Trainer" "${TRAINER_MSG:-Time for reps!}" "blue"
       fi
     ) & disown 2>/dev/null
   fi

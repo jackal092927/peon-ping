@@ -34,6 +34,47 @@ The config file is at `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/peon-ping/confi
 2. Edit the relevant field(s) using the Edit tool
 3. Confirm the change to the user
 
+## Common Configuration Examples
+
+### Disable desktop notification popups but keep sounds
+
+**User request:** "Disable desktop notifications"
+
+**Action:**
+Set `desktop_notifications: false` in config
+
+**Result:**
+- ✅ Sounds continue playing (voice reminders)
+- ❌ Desktop notification popups suppressed
+- ✅ Mobile notifications unaffected (separate toggle)
+
+**Alternative CLI command:**
+```bash
+peon notifications off
+# or
+peon popups off
+```
+
+### Adjust volume
+
+**User request:** "Set volume to 30%"
+
+**Action:**
+Set `volume: 0.3` in config
+
+### Enable round-robin pack rotation
+
+**User request:** "Enable round-robin pack rotation with peon and glados"
+
+**Action:**
+Set:
+```json
+{
+  "pack_rotation": ["peon", "glados"],
+  "pack_rotation_mode": "round-robin"
+}
+```
+
 ## List available packs
 
 To show available packs, run:

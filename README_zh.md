@@ -175,8 +175,23 @@ peon-ping 在 Claude Code 中安装两个斜杠命令：
 }
 ```
 
+### 独立控制
+
+peon-ping 有三个独立的控制开关，可以混合使用：
+
+| 配置键 | 控制项 | 影响声音 | 影响桌面弹窗 | 影响手机推送 |
+|--------|--------|----------|--------------|--------------|
+| `enabled` | 主音频开关 | ✅ 是 | ❌ 否 | ❌ 否 |
+| `desktop_notifications` | 桌面弹窗横幅 | ❌ 否 | ✅ 是 | ❌ 否 |
+| `mobile_notify.enabled` | 手机推送通知 | ❌ 否 | ❌ 否 | ✅ 是 |
+
+这意味着您可以：
+- 保留声音但禁用桌面弹窗：`peon notifications off`
+- 保留桌面弹窗但禁用声音：`peon pause`
+- 启用手机推送但不显示桌面弹窗：设置 `desktop_notifications: false` 和 `mobile_notify.enabled: true`
+
 - **volume**：0.0–1.0（适合办公室使用的音量）
-- **desktop_notifications**：`true`/`false` — 独立于声音控制桌面通知弹窗（默认：`true`）
+- **desktop_notifications**：`true`/`false` — 独立于声音控制桌面通知弹窗（默认：`true`）。禁用时，声音继续播放但视觉弹窗被抑制。手机通知不受影响。
 - **notification_style**：`"overlay"` 或 `"standard"` — 控制桌面通知显示方式（默认：`"overlay"`）
   - **overlay**：大型醒目横幅 — macOS 上使用 JXA Cocoa 覆盖，WSL/MSYS2 上使用 Windows Forms 弹窗。点击覆盖层可聚焦终端（支持 Ghostty、Warp、iTerm2、Zed、Terminal.app）。在 iTerm2 上，点击可聚焦到正确的标签页/窗格/窗口。
   - **standard**：系统通知 — macOS 上使用 [`terminal-notifier`](https://github.com/julienXX/terminal-notifier) / `osascript`，WSL/MSYS2 上使用 Windows toast。安装 `terminal-notifier`（`brew install terminal-notifier`）后，点击通知可自动聚焦终端
@@ -188,6 +203,7 @@ peon-ping 在 Claude Code 中安装两个斜杠命令：
 - **categories**：单独开关 CESP 声音分类（例如 `"session.start": false` 禁用问候声音）
 - **annoyed_threshold / annoyed_window_seconds**：在 N 秒内多少次提示触发 `user.spam` 彩蛋
 - **silent_window_seconds**：对于短于 N 秒的任务，抑制 `task.complete` 声音和通知。（例如 `10` 表示只播放超过 10 秒的任务声音）
+- **session_start_cooldown_seconds**（数字，默认：`30`）：当多个工作区同时启动时（例如用 OpenCode 或 Cursor 打开多个文件夹），对问候声音进行去重。只有第一个会话启动会播放问候声；在此窗口期内的后续会话保持静默。设为 `0` 可禁用去重，始终播放问候声。
 - **suppress_subagent_complete**（布尔值，默认：`false`）：当子 Agent 会话结束时，抑制 `task.complete` 声音和通知。当 Claude Code 的 Task 工具并行派发多个子 Agent 时，每个子 Agent 完成都会触发一次提示音——将此选项设为 `true`，则只播放父会话的完成提示音。
 - **default_pack**：当没有更具体的规则时使用的备选语音包（默认：`"peon"`）。取代旧的 `active_pack` 键——现有配置在 `peon update` 时自动迁移。
 - **path_rules**：`{ "pattern": "...", "pack": "..." }` 对象数组。根据工作目录使用通配符匹配（`*`、`?`）为会话分配语音包。第一个匹配规则生效，优先级高于 `pack_rotation` 和 `default_pack`，但低于 `session_override` 分配。
@@ -195,6 +211,50 @@ peon-ping 在 Claude Code 中安装两个斜杠命令：
 - **pack_rotation_mode**：`"random"`（默认）、`"round-robin"` 或 `"session_override"`。使用 `random`/`round-robin` 时，每个会话从 `pack_rotation` 中选择一个语音包。使用 `session_override` 时，`/peon-ping-use <pack>` 命令为每个会话分配语音包。无效或缺失的语音包会按层级回退。（`"agentskill"` 作为 `"session_override"` 的旧别名仍被接受。）
 - **session_ttl_days**（数字，默认：7）：使超过 N 天的陈旧每会话语音包分配过期。防止使用 `session_override` 模式时 `.state.json` 无限增长。
 - **headphones_only**（布尔值，默认：`false`）：仅在检测到耳机或外部音频设备时播放声音。启用后，如果内置扬声器是活动输出，声音将被静音 — 适用于开放式办公室。使用 `peon status` 查看状态。支持 macOS（通过 `system_profiler`）和 Linux（通过 PipeWire `wpctl` 或 PulseAudio `pactl`）。
+- **suppress_sound_when_tab_focused**（布尔值，默认：`false`）：当生成钩子事件的终端标签页处于当前活动/聚焦状态时，跳过声音播放。声音仍会在后台标签页中播放，提醒您其他地方发生了事件。桌面和移动通知不受影响。适用于只想在未查看的标签页中听到音频提示的用户。仅支持 macOS（使用 `osascript` 检查最前端应用和 iTerm2 标签页焦点）。
+- **notification_position**（字符串，默认：`"top-center"`）：覆盖通知在屏幕上的显示位置。选项：`"top-left"`、`"top-center"`、`"top-right"`、`"bottom-left"`、`"bottom-center"`、`"bottom-right"`。
+- **notification_dismiss_seconds**（数字，默认：`4`）：覆盖通知在 N 秒后自动消失。设为 `0` 则通知持续显示，需点击关闭。
+- **notification_title_override**（字符串，默认：`""`）：覆盖通知标题中显示的项目名称。为空时自动检测：`.peon-label` > `project_name_map` > git 仓库名 > 文件夹名。
+- **project_name_map**（对象，默认：`{}`）：将目录路径映射为通知中的自定义项目标签。键为路径模式，值为显示名称。
+- **notification_templates**（对象，默认：`{}`）：自定义通知事件的消息格式。键为事件类型（`stop`、`permission`、`error`、`idle`、`question`），值为支持变量替换的模板字符串。可用变量：`{project}`、`{summary}`、`{tool_name}`、`{status}`、`{event}`。
+
+## 常见用例
+
+### 保留声音但禁用弹窗
+
+想要语音反馈但不想要视觉干扰？
+
+```bash
+peon notifications off
+```
+
+这会保持所有声音类别的播放，同时禁用桌面通知横幅。手机通知（如果已配置）继续工作。
+
+您也可以使用别名：
+
+```bash
+peon popups off
+```
+
+### 静音模式但保留通知
+
+想要视觉提醒但不要音频？
+
+```bash
+peon pause  # 或在配置中设置 "enabled": false
+```
+
+当 `desktop_notifications: true` 时，您将收到弹窗但没有声音。
+
+### 完全静音
+
+禁用所有功能：
+
+```bash
+peon pause
+peon notifications off
+peon mobile off
+```
 
 ## Peon 教练
 

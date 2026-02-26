@@ -195,6 +195,10 @@ peon notifications off    # Disable desktop notifications
 peon notifications overlay   # Use large overlay banners (default)
 peon notifications standard  # Use standard system notifications
 peon notifications test      # Send a test notification
+peon notifications position [pos]    # Get/set notification position (top-left, top-center, top-right, bottom-left, bottom-center, bottom-right)
+peon notifications dismiss [N]       # Get/set auto-dismiss time in seconds (0 = persistent)
+peon notifications label [text|reset] # Get/set project label override for notifications
+peon notifications template [key] [fmt]  # Get/set/reset message templates (keys: stop, permission, error, idle, question)
 peon preview              # Play all sounds from session.start
 peon preview <category>   # Play all sounds from a specific category
 peon preview --list       # List all categories in the active pack
@@ -240,8 +244,23 @@ Config location depends on install mode:
 }
 ```
 
+### Independent Controls
+
+peon-ping has three independent controls that can be mixed and matched:
+
+| Config Key | Controls | Affects Sounds | Affects Desktop Popups | Affects Mobile Push |
+|------------|----------|----------------|------------------------|---------------------|
+| `enabled` | Master audio switch | ✅ Yes | ❌ No | ❌ No |
+| `desktop_notifications` | Desktop popup banners | ❌ No | ✅ Yes | ❌ No |
+| `mobile_notify.enabled` | Phone push notifications | ❌ No | ❌ No | ✅ Yes |
+
+This means you can:
+- Keep sounds but disable desktop popups: `peon notifications off`
+- Keep desktop popups but disable sounds: `peon pause`
+- Enable mobile push without desktop popups: set `desktop_notifications: false` and `mobile_notify.enabled: true`
+
 - **volume**: 0.0–1.0 (quiet enough for the office)
-- **desktop_notifications**: `true`/`false` — toggle desktop notification popups independently from sounds (default: `true`)
+- **desktop_notifications**: `true`/`false` — toggle desktop notification popups independently from sounds (default: `true`). When disabled, sounds continue playing but visual popups are suppressed. Mobile notifications are unaffected.
 - **notification_style**: `"overlay"` or `"standard"` — controls how desktop notifications appear (default: `"overlay"`)
   - **overlay**: large, visible banners — JXA Cocoa overlay on macOS, Windows Forms popup on WSL/MSYS2. Clicking the overlay focuses your terminal (supports Ghostty, Warp, iTerm2, Zed, Terminal.app). On iTerm2, clicking focuses the correct tab/pane/window — not just the app.
   - **standard**: system notifications — [`terminal-notifier`](https://github.com/julienXX/terminal-notifier) / `osascript` on macOS, Windows toast on WSL/MSYS2. When `terminal-notifier` is installed (`brew install terminal-notifier`), clicking a standard notification focuses your terminal automatically (supports Ghostty, Warp, iTerm2, Zed, Terminal.app)
@@ -252,6 +271,7 @@ Config location depends on install mode:
 - **categories**: Toggle individual CESP sound categories on/off (e.g. `"session.start": false` to disable greeting sounds)
 - **annoyed_threshold / annoyed_window_seconds**: How many prompts in N seconds triggers the `user.spam` easter egg
 - **silent_window_seconds**: Suppress `task.complete` sounds and notifications for tasks shorter than N seconds. (e.g. `10` to only hear sounds for tasks that take longer than 10 seconds)
+- **session_start_cooldown_seconds** (number, default: `30`): Deduplicates greeting sounds when multiple workspaces start at the same time (e.g. opening OpenCode or Cursor with many folders). Only the first session start plays the greeting; subsequent ones within this window stay silent. Set to `0` to disable deduplication and always play a greeting.
 - **suppress_subagent_complete** (boolean, default: `false`): Suppress `task.complete` sounds and notifications when a sub-agent session finishes. When Claude Code's Task tool dispatches parallel sub-agents, each one fires a completion sound — set this to `true` to hear only the parent session's completion sound.
 - **default_pack**: The fallback pack used when no more specific rule applies (default: `"peon"`). Replaces the old `active_pack` key — existing configs are migrated automatically on `peon update`.
 - **path_rules**: Array of `{ "pattern": "...", "pack": "..." }` objects. Assigns a pack to sessions based on the working directory using glob matching (`*`, `?`). First matching rule wins. Beats `pack_rotation` and `default_pack`; overridden by `session_override` assignments.
@@ -265,6 +285,51 @@ Config location depends on install mode:
 - **pack_rotation_mode**: `"random"` (default), `"round-robin"`, or `"session_override"`. With `random`/`round-robin`, each session picks one pack from `pack_rotation`. With `session_override`, the `/peon-ping-use <pack>` command assigns a pack per session. Invalid or missing packs fall back through the hierarchy. (`"agentskill"` is accepted as a legacy alias for `"session_override"`.)
 - **session_ttl_days** (number, default: 7): Expire stale per-session pack assignments older than N days. Keeps `.state.json` from growing unbounded when using `session_override` mode.
 - **headphones_only** (boolean, default: `false`): Only play sounds when headphones or external audio devices are detected. When enabled, sounds are suppressed if built-in speakers are the active output — useful for open offices. Check status with `peon status`. Supported on macOS (via `system_profiler`) and Linux (via PipeWire `wpctl` or PulseAudio `pactl`).
+- **suppress_sound_when_tab_focused** (boolean, default: `false`): Skip sound playback when the terminal tab that generated the hook event is the currently active/focused tab. Sounds still play for background tabs as an alert that something happened elsewhere. Desktop and mobile notifications are unaffected. Useful when you only want audio cues from tabs you're not watching. macOS only (uses `osascript` to check frontmost app and iTerm2 tab focus).
+- **meeting_detect** Detects if the microphone is currently being used and temporarily suppresses the audio only until the microphone is no longer in use. Notification still appears.
+- **notification_position** (string, default: `"top-center"`): Where overlay notifications appear on screen. Options: `"top-left"`, `"top-center"`, `"top-right"`, `"bottom-left"`, `"bottom-center"`, `"bottom-right"`.
+- **notification_dismiss_seconds** (number, default: `4`): Auto-dismiss overlay notifications after N seconds. Set to `0` for persistent notifications that require a click to dismiss.
+- **notification_title_override** (string, default: `""`): Override the project name shown in notification titles. When empty, the project name is auto-detected from `.peon-label` > `project_name_map` > git repo name > folder name.
+- **project_name_map** (object, default: `{}`): Map directory paths to custom project labels for notifications. Keys are path patterns, values are display names. Example: `{ "/home/user/work/client-a": "Client A" }`.
+- **notification_templates** (object, default: `{}`): Custom message format strings for notification events. Keys are event types (`stop`, `permission`, `error`, `idle`, `question`), values are template strings with variable substitution. Available variables: `{project}`, `{summary}`, `{tool_name}`, `{status}`, `{event}`. Example: `{ "stop": "{project}: {summary}", "permission": "{project}: {tool_name} needs approval" }`.
+
+## Common Use Cases
+
+### Sounds without popups
+
+Want voice feedback but no visual distractions?
+
+```bash
+peon notifications off
+```
+
+This keeps all sound categories playing while suppressing desktop notification banners. Mobile notifications (if configured) continue working.
+
+You can also use the alias:
+
+```bash
+peon popups off
+```
+
+### Silent mode with notifications only
+
+Want visual alerts but no audio?
+
+```bash
+peon pause  # or set "enabled": false in config
+```
+
+With `desktop_notifications: true`, you'll get popups but no sounds.
+
+### Complete silence
+
+Disable everything:
+
+```bash
+peon pause
+peon notifications off
+peon mobile off
+```
 
 ## Peon Trainer
 

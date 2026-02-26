@@ -163,12 +163,15 @@ try {
     if (Test-Path $statePath) {
         $state = Get-Content $statePath -Raw | ConvertFrom-Json
     } else {
-        $state = @{}
+        # Use PSCustomObject (not hashtable) so Add-Member works correctly on it
+        $state = [PSCustomObject]@{}
     }
     
     # Ensure session_packs exists
     if (-not $state.session_packs) {
-        $state | Add-Member -NotePropertyName "session_packs" -NotePropertyValue @{} -Force
+        # Use PSCustomObject (not hashtable @{}) so subsequent Add-Member calls correctly
+        # insert key-value entries rather than adding NoteProperties to the hashtable object
+        $state | Add-Member -NotePropertyName "session_packs" -NotePropertyValue ([PSCustomObject]@{}) -Force
     }
     
     # Map this session to the requested pack (new dict format with timestamp)

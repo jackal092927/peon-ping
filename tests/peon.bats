@@ -28,6 +28,33 @@ teardown() {
   ! afplay_was_called
 }
 
+@test "rapid SessionStart events from multiple workspaces are debounced" {
+  # First SessionStart plays the greeting
+  run_peon '{"hook_event_name":"SessionStart","cwd":"/tmp/proj1","session_id":"s1","permission_mode":"default"}'
+  [ "$PEON_EXIT" -eq 0 ]
+  count1=$(afplay_call_count)
+  [ "$count1" = "1" ]
+
+  # Second SessionStart (different session, same instant) does NOT play again
+  run_peon '{"hook_event_name":"SessionStart","cwd":"/tmp/proj2","session_id":"s2","permission_mode":"default"}'
+  [ "$PEON_EXIT" -eq 0 ]
+  count2=$(afplay_call_count)
+  [ "$count2" = "1" ]
+}
+
+@test "SessionStart plays greeting after cooldown expires" {
+  # Set last_session_start_sound_time to 60 seconds ago (beyond 30s default cooldown)
+  /usr/bin/python3 -c "
+import json, time
+state = json.load(open('$TEST_DIR/.state.json'))
+state['last_session_start_sound_time'] = time.time() - 60
+json.dump(state, open('$TEST_DIR/.state.json', 'w'))
+"
+  run_peon '{"hook_event_name":"SessionStart","cwd":"/tmp/myproject","session_id":"s1","permission_mode":"default"}'
+  [ "$PEON_EXIT" -eq 0 ]
+  afplay_was_called
+}
+
 @test "Notification permission_prompt sets tab title but no sound (PermissionRequest handles sound)" {
   run_peon '{"hook_event_name":"Notification","notification_type":"permission_prompt","cwd":"/tmp/myproject","session_id":"s1","permission_mode":"default"}'
   [ "$PEON_EXIT" -eq 0 ]
@@ -2511,7 +2538,7 @@ json.dump(m, open('$TEST_DIR/packs/peon/manifest.json', 'w'))
   run_peon '{"hook_event_name":"Stop","cwd":"/tmp/myproject","session_id":"s1","permission_mode":"default"}'
   [ "$PEON_EXIT" -eq 0 ]
   [ -f "$TEST_DIR/overlay.log" ]
-  # overlay.log line: -l JavaScript /path/mac-overlay.js msg color icon slot dismiss ide_pid
+  # overlay.log line: -l JavaScript /path/mac-overlay.js msg color icon slot dismiss bundle_id ide_pid session_tty subtitle notif_position
   args=$(tail -1 "$TEST_DIR/overlay.log")
   # Count space-separated tokens — should be at least 7 after "-l JavaScript script"
   count=$(echo "$args" | wc -w | tr -d ' ')
@@ -2525,7 +2552,10 @@ json.dump(m, open('$TEST_DIR/packs/peon/manifest.json', 'w'))
   run_peon '{"hook_event_name":"Stop","cwd":"/tmp/myproject","session_id":"s1","permission_mode":"default"}'
   [ "$PEON_EXIT" -eq 0 ]
   [ -f "$TEST_DIR/overlay.log" ]
-  ide_pid=$(tail -1 "$TEST_DIR/overlay.log" | awk '{print $NF}')
+  # Fields from end: ... bundle_id ide_pid session_tty subtitle notif_position
+  # With awk (empty fields collapse): ... bundle_id ide_pid session_tty notif_position
+  # ide_pid is NF-2 (session_tty=NF-1, notif_position=NF)
+  ide_pid=$(tail -1 "$TEST_DIR/overlay.log" | awk '{print $(NF-2)}')
   [[ "$ide_pid" =~ ^[0-9]+$ ]]
 }
 
@@ -3160,6 +3190,94 @@ json.dump(c, open('$TEST_DIR/config.json', 'w'))
 @test "headphones_only disabled: plays sound regardless of output device" {
   # headphones_only defaults to false, mock speakers only
   touch "$TEST_DIR/.mock_speakers_only"
+
+  run_peon '{"hook_event_name":"Stop","cwd":"/tmp/myproject","session_id":"s1","permission_mode":"default"}'
+  [ "$PEON_EXIT" -eq 0 ]
+  afplay_was_called
+}
+
+# ============================================================
+# Meeting detection — auto-suppress during calls
+# ============================================================
+
+@test "meeting_detect: plays sound when no meeting active" {
+  # Enable meeting_detect in config
+  /usr/bin/python3 -c "
+import json
+c = json.load(open('$TEST_DIR/config.json'))
+c['meeting_detect'] = True
+json.dump(c, open('$TEST_DIR/config.json', 'w'))
+"
+  # No meeting fixtures → detect_meeting returns 1
+
+  run_peon '{"hook_event_name":"Stop","cwd":"/tmp/myproject","session_id":"s1","permission_mode":"default"}'
+  [ "$PEON_EXIT" -eq 0 ]
+  afplay_was_called
+}
+
+@test "meeting_detect: skips sound when mic in use" {
+  # Enable meeting_detect in config
+  /usr/bin/python3 -c "
+import json
+c = json.load(open('$TEST_DIR/config.json'))
+c['meeting_detect'] = True
+json.dump(c, open('$TEST_DIR/config.json', 'w'))
+"
+  # Mock mic in use (layer 2)
+  touch "$TEST_DIR/.mock_mic_in_use"
+
+  run_peon '{"hook_event_name":"Stop","cwd":"/tmp/myproject","session_id":"s1","permission_mode":"default"}'
+  [ "$PEON_EXIT" -eq 0 ]
+  ! afplay_was_called
+}
+
+@test "meeting_detect disabled: plays sound regardless" {
+  # meeting_detect defaults to false, mock an active meeting
+  touch "$TEST_DIR/.mock_meeting_active"
+
+  run_peon '{"hook_event_name":"Stop","cwd":"/tmp/myproject","session_id":"s1","permission_mode":"default"}'
+  [ "$PEON_EXIT" -eq 0 ]
+  afplay_was_called
+}
+
+# ============================================================
+# Suppress sound when tab focused
+# ============================================================
+
+@test "suppress_sound_when_tab_focused: skips sound when terminal is focused" {
+  # Enable the feature
+  /usr/bin/python3 -c "
+import json
+c = json.load(open('$TEST_DIR/config.json'))
+c['suppress_sound_when_tab_focused'] = True
+json.dump(c, open('$TEST_DIR/config.json', 'w'))
+"
+  # Mock terminal as focused (Terminal.app — a recognized terminal)
+  echo "Terminal" > "$TEST_DIR/.mock_terminal_focused"
+
+  run_peon '{"hook_event_name":"Stop","cwd":"/tmp/myproject","session_id":"s1","permission_mode":"default"}'
+  [ "$PEON_EXIT" -eq 0 ]
+  ! afplay_was_called
+}
+
+@test "suppress_sound_when_tab_focused: plays sound when terminal is not focused" {
+  # Enable the feature
+  /usr/bin/python3 -c "
+import json
+c = json.load(open('$TEST_DIR/config.json'))
+c['suppress_sound_when_tab_focused'] = True
+json.dump(c, open('$TEST_DIR/config.json', 'w'))
+"
+  # Default mock: osascript returns "Safari" (not a terminal) — not focused
+
+  run_peon '{"hook_event_name":"Stop","cwd":"/tmp/myproject","session_id":"s1","permission_mode":"default"}'
+  [ "$PEON_EXIT" -eq 0 ]
+  afplay_was_called
+}
+
+@test "suppress_sound_when_tab_focused disabled: plays sound even when terminal is focused" {
+  # Feature defaults to false — mock terminal as focused
+  echo "Terminal" > "$TEST_DIR/.mock_terminal_focused"
 
   run_peon '{"hook_event_name":"Stop","cwd":"/tmp/myproject","session_id":"s1","permission_mode":"default"}'
   [ "$PEON_EXIT" -eq 0 ]
